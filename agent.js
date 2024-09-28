@@ -1,7 +1,6 @@
 /* 
 I know I could've built this "agent" in a faster language, but I wanted to go with JavaScript for its flexibility. 
 */
-
 const axios = require("axios");
 const dns = require("dns").promises;
 const ping = require("ping");
