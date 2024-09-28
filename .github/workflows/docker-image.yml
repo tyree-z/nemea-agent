@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - main
+      - dev
+    tags:
+      - "v*" # Match any tag that starts with 'v'
 
 jobs:
   build-and-push:
@@ -24,7 +27,27 @@ jobs:
 
       - name: Build and Push Multi-Architecture Docker Images
         run: |
-          # Create the multi-architecture build
-          docker buildx build --platform linux/amd64,linux/arm64 \
-            -t tyreez/nemea-agent:latest \
-            --push .
+          # Determine the tag based on whether it's a release or dev build
+          TAG=${GITHUB_REF##*/} # Get the last part of the GITHUB_REF
+
+          # Build and push the image with the appropriate tag
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            # For release tags
+            echo "Building release image with tag: $TAG"
+            docker buildx build --platform linux/amd64,linux/arm64 \
+              -t tyreez/nemea-agent:$TAG \
+              -t tyreez/nemea-agent:latest \ # Tag the latest release image
+              --push .
+          elif [[ $GITHUB_REF == refs/heads/dev ]]; then
+            # For dev branch
+            echo "Building development image with tag: dev"
+            docker buildx build --platform linux/amd64,linux/arm64 \
+              -t tyreez/nemea-agent:dev \
+              --push .
+          elif [[ $GITHUB_REF == refs/heads/main ]]; then
+            # For changes to the main branch, also update latest
+            echo "Building latest image from main branch"
+            docker buildx build --platform linux/amd64,linux/arm64 \
+              -t tyreez/nemea-agent:latest \
+              --push .
+          fi
