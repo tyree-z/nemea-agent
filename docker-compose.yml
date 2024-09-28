@@ -1,0 +1,20 @@
+services:
+  watchtower:
+    container_name: watchtower
+    image: containrrr/watchtower
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_SCHEDULE=0 */2 * * *
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+  nemea-agent:
+    container_name: nemea-agent
+    build: .
+    image: tyree-z/nemea-agent:latest
+    environment:
+      - API_KEY=${API_KEY}
+      - CONFIG_URL=${CONFIG_URL}
+      - GEO_API_KEY=${GEO_API_KEY}
+    restart: always
+    volumes:
+      - ./logs:/app/logs
