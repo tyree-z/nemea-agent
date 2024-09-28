@@ -10,7 +10,7 @@ services:
   nemea-agent:
     container_name: nemea-agent
     build: .
-    image: tyree-z/nemea-agent:latest
+    image: tyreez/nemea-agent:latest
     environment:
       - API_KEY=${API_KEY}
       - CONFIG_URL=${CONFIG_URL}

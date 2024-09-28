@@ -22,7 +22,7 @@ const logger = winston.createLogger({
   ],
 });
 
-logger.info("Nemea Agent started");
+logger.info("Nemea Agent started.");
 
 class NemeaAgent extends EventEmitter {
   constructor(apiKey, configUrl, geoApiKey) {
