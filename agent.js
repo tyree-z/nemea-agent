@@ -1,15 +1,11 @@
-/* 
-I know I could've built this "agent" in a faster language, but I wanted to go with JavaScript for its flexibility. 
-*/
 const axios = require("axios");
-const dns = require("dns").promises;
+const dns = require("node:dns");
 const ping = require("ping");
 const {
   setIntervalAsync,
   clearIntervalAsync,
 } = require("set-interval-async/dynamic");
 const EventEmitter = require("events");
-const http = require("http");
 const winston = require("winston");
 
 const logger = winston.createLogger({
@@ -67,12 +63,36 @@ class NemeaAgent extends EventEmitter {
       const response = await axios.get(`${this.configUrl}/v1/nemea/monitors`, {
         headers: {Authorization: `Bearer ${this.apiKey}`},
       });
-      this.monitors = response.data.monitors;
+
+      // Check if the response indicates failure
+      if (!response.data.success) {
+        logger.warn(response.data.message);
+        this.retryFetchMonitors();
+        return; // Exit the function early
+      }
+
+      this.monitors = response.data.monitors.map((monitor) => ({
+        id: monitor.id,
+        type: monitor.type,
+        recordType: monitor.record_type,
+        domain: monitor.domain,
+        server: monitor.server,
+        host: monitor.host,
+        interval: monitor.interval,
+      }));
+
       logger.debug("Monitors fetched successfully:", this.monitors);
       this.emit("monitorsFetched");
     } catch (error) {
       this.handleError("fetching monitors", error);
     }
+  }
+
+  retryFetchMonitors() {
+    logger.info("Retrying to fetch monitors in 30 seconds...");
+    setTimeout(() => {
+      this.fetchMonitors();
+    }, 30000);
   }
 
   handleError(action, error) {
@@ -123,16 +143,44 @@ class NemeaAgent extends EventEmitter {
       let result;
       switch (recordType) {
         case "A":
-          result = await dns.resolve4(domain, {ttl: true});
+          result = await new Promise((resolve, reject) => {
+            dns.resolve4(
+              domain,
+              {ttl: true, timeout: 10000},
+              (err, addresses) => {
+                if (err) reject(err);
+                else resolve(addresses);
+              }
+            );
+          });
           break;
         case "AAAA":
-          result = await dns.resolve6(domain, {ttl: true});
+          result = await new Promise((resolve, reject) => {
+            dns.resolve6(
+              domain,
+              {ttl: true, timeout: 10000},
+              (err, addresses) => {
+                if (err) reject(err);
+                else resolve(addresses);
+              }
+            );
+          });
           break;
         case "SOA":
-          result = await dns.resolveSoa(domain);
+          result = await new Promise((resolve, reject) => {
+            dns.resolveSoa(domain, (err, soaRecord) => {
+              if (err) reject(err);
+              else resolve(soaRecord);
+            });
+          });
           break;
         case "CNAME":
-          result = await dns.resolveCname(domain);
+          result = await new Promise((resolve, reject) => {
+            dns.resolveCname(domain, (err, cnameRecords) => {
+              if (err) reject(err);
+              else resolve(cnameRecords);
+            });
+          });
           break;
         default:
           throw new Error("Unsupported record type");
