@@ -20,6 +20,7 @@
   "dependencies": {
     "axios": "^1.7.7",
     "dns": "^0.2.2",
+    "dotenv": "^16.4.5",
     "events": "^3.3.0",
     "http": "^0.0.1-security",
     "ping": "^0.4.4",
