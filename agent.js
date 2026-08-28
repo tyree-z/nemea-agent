@@ -1,6 +1,9 @@
 require("dotenv").config();
 const axios = require("axios");
 const dns = require("node:dns");
+const fs = require("node:fs");
+const path = require("node:path");
+const os = require("node:os");
 const ping = require("ping");
 const {
   setIntervalAsync,
@@ -20,6 +23,23 @@ const logger = winston.createLogger({
 
 logger.info("Nemea Agent started.");
 
+// Used until the server answers. Every one of these was a literal scattered through
+// this file; they are here so there is one place to see what an unconfigured agent
+// does, and so the server can change any of them without a release.
+const FALLBACK_SETTINGS = {
+  pingCount: 5,
+  pingTimeout: 5000,
+  dnsTimeout: 10000,
+  dnsServers: [],
+  dnsUseSystemFallback: true,
+  monitorPollInterval: 30000,
+  configPollInterval: 30000,
+  heartbeatInterval: 30000,
+  retryDelay: 5000,
+  monitorRetryDelay: 30000,
+  geoCacheSeconds: 3600,
+};
+
 class NemeaAgent extends EventEmitter {
   constructor(apiKey, configUrl, geoApiKey) {
     super();
@@ -30,19 +50,173 @@ class NemeaAgent extends EventEmitter {
     this.config = null;
     this.refreshInterval = null;
 
-    // Caching variables for geolocation
+    // Identity. `apiKey` is the shared enrolment key and gets us through the door
+    // exactly once; `token` is this agent's own and is what everything else uses.
+    this.agentId = null;
+    this.token = process.env.AGENT_TOKEN || null;
+    this.statePath =
+      process.env.AGENT_STATE_FILE || path.join(__dirname, "state", "agent.json");
+
+    // Server-controlled. Replaced wholesale on every heartbeat.
+    this.settings = {...FALLBACK_SETTINGS};
+    // Set false from the console to stop measuring without deleting the agent. It
+    // keeps heartbeating while paused, because that is how it finds out it is back on.
+    this.enabled = true;
+    this.running = false;
+
     this.geoCache = null;
     this.geoCacheTimestamp = 0;
-    this.CACHE_EXPIRATION = 60 * 1000;
+  }
+
+  /**
+   * The credential for everything except enrolment.
+   *
+   * Falls back to the shared key so an agent that cannot enrol - an older API, a
+   * network blip during first boot - keeps measuring instead of going dark. Its
+   * samples land unattributed, which is worse than attributed and much better than
+   * nothing.
+   */
+  authHeader() {
+    return {Authorization: `Bearer ${this.token || this.apiKey}`};
+  }
+
+  /**
+   * Load this agent's identity from disk, enrolling if it has none.
+   *
+   * The token is written to a file rather than held in memory because the container
+   * is replaced on every update by watchtower; without this, each new image would
+   * enrol a fresh agent and the old one would sit in the console going stale forever.
+   */
+  async enrol() {
+    if (this.token) {
+      logger.info("Using the agent token from the environment");
+      return;
+    }
+
+    try {
+      const saved = JSON.parse(fs.readFileSync(this.statePath, "utf8"));
+      if (saved.token) {
+        this.token = saved.token;
+        this.agentId = saved.agentId || null;
+        logger.info(`Resuming as agent ${this.agentId || "(id unknown)"}`);
+        return;
+      }
+    } catch {
+      // No state file yet. That is the normal first boot, not an error.
+    }
+
+    if (!this.apiKey) {
+      logger.error("No API_KEY and no stored token - cannot enrol");
+      return;
+    }
+
+    try {
+      const location = await this.getGeolocation();
+      const response = await axios.post(
+        `${this.configUrl}/v1/nemea/agents/register`,
+        {
+          name: process.env.AGENT_NAME || undefined,
+          hostname: os.hostname(),
+          version: require("./package.json").version,
+          location: location || {},
+        },
+        {headers: {Authorization: `Bearer ${this.apiKey}`}}
+      );
+
+      this.token = response.data.token;
+      this.agentId = response.data.agent.id;
+      this.saveState();
+      logger.info(
+        `Enrolled as "${response.data.agent.name}" (${this.agentId})`
+      );
+    } catch (error) {
+      this.handleError("enrolling", error);
+      logger.warn("Continuing on the shared key; samples will be unattributed");
+    }
+  }
+
+  saveState() {
+    try {
+      fs.mkdirSync(path.dirname(this.statePath), {recursive: true});
+      fs.writeFileSync(
+        this.statePath,
+        JSON.stringify({agentId: this.agentId, token: this.token}, null, 2),
+        // The token is a credential: readable by the user that runs the agent only.
+        {mode: 0o600}
+      );
+    } catch (error) {
+      logger.error(
+        `Could not save agent state to ${this.statePath}: ${error.message}. ` +
+          "This agent will enrol again as a new one when it restarts."
+      );
+    }
+  }
+
+  /**
+   * Report in, and collect settings in the same call.
+   *
+   * One round trip rather than a heartbeat plus a config poll: the server has to
+   * write `last_seen_at` either way, and it may as well answer with what changed.
+   */
+  async heartbeat() {
+    if (!this.token) return;
+    try {
+      const response = await axios.post(
+        `${this.configUrl}/v1/nemea/agents/heartbeat`,
+        {
+          version: require("./package.json").version,
+          hostname: os.hostname(),
+          location: (await this.getGeolocation()) || undefined,
+        },
+        {headers: this.authHeader()}
+      );
+      await this.applySettings(response.data.config, response.data.enabled);
+    } catch (error) {
+      this.handleError("sending heartbeat", error);
+    }
+  }
+
+  /**
+   * Take the server's settings, and restart monitoring only if it matters.
+   *
+   * Intervals are baked into timers when monitoring starts, so a changed interval
+   * needs a restart to take effect - but restarting on every heartbeat would throw
+   * away in-flight measurements thirty seconds at a time.
+   */
+  async applySettings(config, enabled) {
+    if (config && typeof config === "object") {
+      const before = this.settings;
+      this.settings = {...FALLBACK_SETTINGS, ...config};
+
+      const timingChanged = [
+        "monitorPollInterval",
+        "configPollInterval",
+        "heartbeatInterval",
+      ].some((key) => before[key] !== this.settings[key]);
+
+      if (timingChanged) {
+        logger.info("Timing settings changed; restarting schedules");
+        await this.restartMonitoring();
+      }
+    }
+
+    if (enabled !== undefined && enabled !== this.enabled) {
+      this.enabled = enabled;
+      logger.info(enabled ? "Enabled by the console" : "Paused by the console");
+      if (enabled) await this.restartMonitoring();
+      else await this.stopMonitoring();
+    }
   }
 
   async fetchConfig() {
     logger.debug("Fetching config from API");
     try {
       const response = await axios.get(`${this.configUrl}/v1/nemea/config`, {
-        headers: {Authorization: `Bearer ${this.apiKey}`},
+        headers: this.authHeader(),
       });
       this.config = response.data;
+      // An enrolled agent gets its own settings back on this call too.
+      await this.applySettings(response.data.config, response.data.enabled);
       logger.debug("Config fetched successfully:", this.config);
 
       if (!this.refreshInterval) {
@@ -62,7 +236,7 @@ class NemeaAgent extends EventEmitter {
     logger.debug("Fetching monitors from API");
     try {
       const response = await axios.get(`${this.configUrl}/v1/nemea/monitors`, {
-        headers: {Authorization: `Bearer ${this.apiKey}`},
+        headers: this.authHeader(),
       });
 
       // Check if the response indicates failure
@@ -90,10 +264,11 @@ class NemeaAgent extends EventEmitter {
   }
 
   retryFetchMonitors() {
-    logger.info("Retrying to fetch monitors in 30 seconds...");
+    const delay = this.settings.monitorRetryDelay;
+    logger.info(`Retrying to fetch monitors in ${delay} ms...`);
     setTimeout(() => {
       this.fetchMonitors();
-    }, 30000);
+    }, delay);
   }
 
   handleError(action, error) {
@@ -103,26 +278,26 @@ class NemeaAgent extends EventEmitter {
       );
       switch (error.response.status) {
         case 502:
-          logger.warn("Received 502 Bad Gateway. Retrying in 5 seconds...");
-          setTimeout(() => {
-            if (action === "fetching config") this.fetchConfig();
-            if (action === "fetching monitors") this.fetchMonitors();
-          }, 5000);
-          break;
-        case 500:
+        case 500: {
+          const delay = this.settings.retryDelay;
           logger.warn(
-            "Received 500 Internal Server Error. Retrying in 5 seconds..."
+            `Received ${error.response.status} from the API. Retrying in ${delay} ms...`
           );
           setTimeout(() => {
             if (action === "fetching config") this.fetchConfig();
             if (action === "fetching monitors") this.fetchMonitors();
-          }, 5000);
+          }, delay);
           break;
+        }
         case 404:
           logger.error("Resource not found. Please check the URL.");
           break;
+        case 401:
         case 403:
-          logger.error("Access forbidden. Please check API key.");
+          logger.error(
+            "Rejected by the API. If this agent was removed from the console its " +
+              "token is dead - delete the state file to enrol again."
+          );
           break;
         default:
           logger.error("Unhandled HTTP error occurred.");
@@ -138,7 +313,15 @@ class NemeaAgent extends EventEmitter {
         server || "default"
       }`
     );
-    if (server) dns.setServers([server]);
+    // A monitor naming a resolver wins; otherwise this agent's configured ones; and
+    // failing both, whatever the machine itself uses - which is usually the honest
+    // measurement, since it is what somebody at this location would actually get.
+    const resolvers = server
+      ? [server]
+      : this.settings.dnsServers?.length
+        ? this.settings.dnsServers
+        : null;
+    if (resolvers) dns.setServers(resolvers);
 
     try {
       let result;
@@ -147,7 +330,7 @@ class NemeaAgent extends EventEmitter {
           result = await new Promise((resolve, reject) => {
             dns.resolve4(
               domain,
-              {ttl: true, timeout: 10000},
+              {ttl: true, timeout: this.settings.dnsTimeout},
               (err, addresses) => {
                 if (err) reject(err);
                 else resolve(addresses);
@@ -159,7 +342,7 @@ class NemeaAgent extends EventEmitter {
           result = await new Promise((resolve, reject) => {
             dns.resolve6(
               domain,
-              {ttl: true, timeout: 10000},
+              {ttl: true, timeout: this.settings.dnsTimeout},
               (err, addresses) => {
                 if (err) reject(err);
                 else resolve(addresses);
@@ -209,11 +392,13 @@ class NemeaAgent extends EventEmitter {
   async monitorPing(host) {
     logger.debug(`Pinging host: ${host}`);
     const pingResults = [];
-    const pingCount = 5;
+    const pingCount = this.settings.pingCount;
 
     for (let i = 0; i < pingCount; i++) {
       try {
-        const res = await ping.promise.probe(host);
+        const res = await ping.promise.probe(host, {
+          timeout: Math.ceil(this.settings.pingTimeout / 1000),
+        });
         if (res.alive) {
           pingResults.push(res.time);
           logger.debug(`Ping response time for ${host}: ${res.time} ms`);
@@ -250,7 +435,7 @@ class NemeaAgent extends EventEmitter {
 
     if (
       this.geoCache &&
-      currentTime - this.geoCacheTimestamp < this.CACHE_EXPIRATION
+      currentTime - this.geoCacheTimestamp < this.settings.geoCacheSeconds * 1000
     ) {
       logger.debug("Using cached geolocation data.");
       return this.geoCache;
@@ -280,7 +465,7 @@ class NemeaAgent extends EventEmitter {
       }
 
       await axios.post(`${this.configUrl}/v1/nemea/ingest`, results, {
-        headers: {Authorization: `Bearer ${this.apiKey}`},
+        headers: this.authHeader(),
       });
       logger.info(
         `Results for ${results.monitorId} (${results.monitorType}) sent successfully`
@@ -307,8 +492,9 @@ class NemeaAgent extends EventEmitter {
     logger.debug("Checking for config changes");
     try {
       const response = await axios.get(`${this.configUrl}/v1/nemea/config`, {
-        headers: {Authorization: `Bearer ${this.apiKey}`},
+        headers: this.authHeader(),
       });
+      await this.applySettings(response.data.config, response.data.enabled);
       const newRefreshInterval = response.data.monitorRefreshInterval || 60000;
 
       if (this.refreshInterval !== newRefreshInterval) {
@@ -329,11 +515,30 @@ class NemeaAgent extends EventEmitter {
   }
 
   async startMonitoring() {
+    if (this.running) return;
+    this.running = true;
+
+    // The schedules run even while paused: a paused agent still has to report in,
+    // or it can never be told it has been switched back on.
+    this.schedules = [
+      setIntervalAsync(() => this.heartbeat(), this.settings.heartbeatInterval),
+      setIntervalAsync(
+        () => this.checkConfigChanges(),
+        this.settings.configPollInterval
+      ),
+      setIntervalAsync(
+        () => this.checkForNewMonitors(),
+        this.settings.monitorPollInterval
+      ),
+    ];
+
+    if (!this.enabled) {
+      logger.info("Paused by the console - reporting in, but not measuring");
+      return;
+    }
+
     logger.info("Starting monitoring");
     await this.fetchMonitors();
-
-    setIntervalAsync(() => this.checkConfigChanges(), 30000);
-    setIntervalAsync(() => this.checkForNewMonitors(), 30000);
 
     this.monitorIntervals = this.monitors.map((monitor) => {
       return setIntervalAsync(async () => {
@@ -362,11 +567,15 @@ class NemeaAgent extends EventEmitter {
 
   async stopMonitoring() {
     logger.info("Stopping monitoring");
-    if (this.monitorIntervals) {
-      for (const interval of this.monitorIntervals) {
-        await clearIntervalAsync(interval);
-      }
+    this.running = false;
+    for (const interval of this.monitorIntervals ?? []) {
+      await clearIntervalAsync(interval);
     }
+    this.monitorIntervals = [];
+    for (const schedule of this.schedules ?? []) {
+      await clearIntervalAsync(schedule);
+    }
+    this.schedules = [];
   }
 }
 
@@ -376,8 +585,15 @@ const agent = new NemeaAgent(
   process.env.GEO_API_KEY // geo API key
 );
 
+// Identity first: enrolment decides which credential every later call carries, and
+// the first heartbeat is what puts this agent on the console's fleet list before it
+// has taken a single measurement.
 agent.on("configFetched", () => agent.startMonitoring());
-agent.fetchConfig();
+(async () => {
+  await agent.enrol();
+  await agent.heartbeat();
+  await agent.fetchConfig();
+})();
 
 // Exit Handlers
 process.on("SIGTERM", async () => {
