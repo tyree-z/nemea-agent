@@ -4,6 +4,7 @@ const dns = require("node:dns");
 const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
+const WebSocket = require("ws");
 const ping = require("ping");
 const {
   setIntervalAsync,
@@ -66,6 +67,119 @@ class NemeaAgent extends EventEmitter {
 
     this.geoCache = null;
     this.geoCacheTimestamp = 0;
+
+    // The live channel. Monitors are polled work and do not need one; an on-demand
+    // measurement is somebody waiting on an answer, and a thirty-second poll cannot
+    // serve that.
+    this.socket = null;
+    this.socketRetry = 1000;
+  }
+
+  /**
+   * Hold a socket open to the API so work can be pushed here.
+   *
+   * Reconnects with backoff and never gives up: an agent whose socket died at 3am
+   * should be answering measurements again by morning without anybody noticing. The
+   * polling loops keep running throughout, so a dead socket costs on-demand
+   * measurements and nothing else.
+   */
+  connectSocket() {
+    if (!this.token) return;
+
+    const url = `${this.configUrl.replace(/^http/, "ws")}/ws/nemea/agent`;
+    const socket = new WebSocket(url);
+    this.socket = socket;
+
+    socket.on("open", () => {
+      socket.send(JSON.stringify({type: "auth", token: this.token}));
+    });
+
+    socket.on("message", async (raw) => {
+      let message;
+      try {
+        message = JSON.parse(raw.toString());
+      } catch {
+        return;
+      }
+
+      if (message.type === "ready") {
+        this.socketRetry = 1000;
+        logger.info("Socket connected; ready for on-demand measurements");
+        return;
+      }
+
+      if (message.type === "measure") {
+        await this.runOnDemand(message.id, message.job);
+      }
+    });
+
+    socket.on("close", (code) => {
+      this.socket = null;
+      // 4401 is a rejected token. Retrying every second with a credential the
+      // server has already refused is just noise in somebody's logs.
+      const delay = code === 4401 ? 60000 : this.socketRetry;
+      logger.warn(`Socket closed (${code}); reconnecting in ${delay} ms`);
+      setTimeout(() => this.connectSocket(), delay);
+      this.socketRetry = Math.min(this.socketRetry * 2, 60000);
+    });
+
+    socket.on("error", (error) => {
+      logger.debug(`Socket error: ${error.message}`);
+    });
+  }
+
+  /**
+   * Run one measurement for somebody who is waiting, and forget it.
+   *
+   * Nothing here touches the monitor list or the ingest endpoint. The result goes
+   * back down the socket that asked for it and is never stored on this side.
+   */
+  async runOnDemand(id, job) {
+    const send = (payload) => {
+      if (this.socket?.readyState === WebSocket.OPEN) {
+        this.socket.send(JSON.stringify({type: "result", id, ...payload}));
+      }
+    };
+
+    // The API refuses obvious private targets, but it cannot know what a hostname
+    // resolves to from here - and "here" is the whole point of a probe network.
+    // Resolving locally and checking is the only place that check can be correct.
+    const refusal = await this.refusePrivate(job.target);
+    if (refusal) {
+      logger.warn(`Refused on-demand measurement of ${job.target}: ${refusal}`);
+      send({error: refusal});
+      return;
+    }
+
+    try {
+      const result =
+        job.type === "DNS"
+          ? await this.monitorDNS(job.recordType || "A", job.target, null)
+          : await this.monitorPing(job.target);
+      send({result});
+    } catch (error) {
+      send({error: error.message});
+    }
+  }
+
+  /** Does this target resolve to somewhere that is nobody else's business? */
+  async refusePrivate(target) {
+    const isPrivate = (address) =>
+      /^(0\.|10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/.test(address) ||
+      address === "::1" ||
+      address.startsWith("fe80") ||
+      address.startsWith("fc") ||
+      address.startsWith("fd");
+
+    if (isPrivate(target)) return "That address is not public";
+
+    try {
+      const {address} = await dns.promises.lookup(target);
+      if (isPrivate(address)) return "That name resolves to a private address";
+    } catch {
+      return "That name does not resolve";
+    }
+    return null;
   }
 
   /**
@@ -520,8 +634,18 @@ class NemeaAgent extends EventEmitter {
 
     // The schedules run even while paused: a paused agent still has to report in,
     // or it can never be told it has been switched back on.
+    this.connectSocket();
+
     this.schedules = [
-      setIntervalAsync(() => this.heartbeat(), this.settings.heartbeatInterval),
+      // Doubles as the socket's keepalive: the server refreshes last_seen_at from
+      // whichever arrives, so an agent with a live socket stays online even if an
+      // HTTP heartbeat fails.
+      setIntervalAsync(() => {
+        if (this.socket?.readyState === WebSocket.OPEN) {
+          this.socket.send(JSON.stringify({type: "ping"}));
+        }
+        return this.heartbeat();
+      }, this.settings.heartbeatInterval),
       setIntervalAsync(
         () => this.checkConfigChanges(),
         this.settings.configPollInterval
@@ -568,6 +692,13 @@ class NemeaAgent extends EventEmitter {
   async stopMonitoring() {
     logger.info("Stopping monitoring");
     this.running = false;
+    // 1000 so the close handler does not schedule a reconnect for a socket we are
+    // deliberately closing.
+    if (this.socket) {
+      this.socket.removeAllListeners("close");
+      this.socket.close(1000);
+      this.socket = null;
+    }
     for (const interval of this.monitorIntervals ?? []) {
       await clearIntervalAsync(interval);
     }
