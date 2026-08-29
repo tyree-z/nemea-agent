@@ -310,7 +310,7 @@ class NemeaAgent extends EventEmitter {
 
       if (timingChanged) {
         logger.info("Timing settings changed; restarting schedules");
-        await this.restartMonitoring();
+        this.restartSchedules();
       }
     }
 
@@ -628,12 +628,17 @@ class NemeaAgent extends EventEmitter {
     await this.startMonitoring();
   }
 
-  async startMonitoring() {
-    if (this.running) return;
-    this.running = true;
-
-    // The schedules run even while paused: a paused agent still has to report in,
-    // or it can never be told it has been switched back on.
+  /**
+   * The polling loops and the socket: everything whose lifetime is the process.
+   *
+   * Kept apart from the measurement timers on purpose. `checkForNewMonitors` runs
+   * inside one of these and restarts monitoring when the work list changes — if that
+   * restart also cleared these, it would be awaiting the very interval it is running
+   * inside, which never resolves. The agent then has nothing left holding the event
+   * loop and exits cleanly, looking for all the world like a normal shutdown.
+   */
+  startSchedules() {
+    if (this.schedules?.length) return;
     this.connectSocket();
 
     this.schedules = [
@@ -655,11 +660,48 @@ class NemeaAgent extends EventEmitter {
         this.settings.monitorPollInterval
       ),
     ];
+  }
+
+  async stopSchedules() {
+    for (const schedule of this.schedules ?? []) {
+      await clearIntervalAsync(schedule);
+    }
+    this.schedules = [];
+
+    // 1000 so the close handler does not schedule a reconnect for a socket we are
+    // deliberately closing.
+    if (this.socket) {
+      this.socket.removeAllListeners("close");
+      this.socket.close(1000);
+      this.socket = null;
+    }
+  }
+
+  /**
+   * Re-create the polling loops after their intervals changed.
+   *
+   * Deferred by a tick because the caller is one of them: clearing an interval from
+   * inside its own handler waits for that handler to return, and it cannot return
+   * until the clear it is waiting on completes.
+   */
+  restartSchedules() {
+    setTimeout(async () => {
+      await this.stopSchedules();
+      this.startSchedules();
+      logger.info("Schedules restarted on the new timings");
+    }, 0);
+  }
+
+  /** The measurement timers only. Safe to cycle from inside a schedule. */
+  async startMonitoring() {
+    this.startSchedules();
 
     if (!this.enabled) {
       logger.info("Paused by the console - reporting in, but not measuring");
       return;
     }
+    if (this.running) return;
+    this.running = true;
 
     logger.info("Starting monitoring");
     await this.fetchMonitors();
@@ -692,21 +734,16 @@ class NemeaAgent extends EventEmitter {
   async stopMonitoring() {
     logger.info("Stopping monitoring");
     this.running = false;
-    // 1000 so the close handler does not schedule a reconnect for a socket we are
-    // deliberately closing.
-    if (this.socket) {
-      this.socket.removeAllListeners("close");
-      this.socket.close(1000);
-      this.socket = null;
-    }
     for (const interval of this.monitorIntervals ?? []) {
       await clearIntervalAsync(interval);
     }
     this.monitorIntervals = [];
-    for (const schedule of this.schedules ?? []) {
-      await clearIntervalAsync(schedule);
-    }
-    this.schedules = [];
+  }
+
+  /** Everything, for a real shutdown. */
+  async shutdown() {
+    await this.stopMonitoring();
+    await this.stopSchedules();
   }
 }
 
@@ -729,12 +766,12 @@ agent.on("configFetched", () => agent.startMonitoring());
 // Exit Handlers
 process.on("SIGTERM", async () => {
   logger.info("SIGTERM signal received: closing agent gracefully");
-  await agent.stopMonitoring();
+  await agent.shutdown();
   process.exit(0);
 });
 
 process.on("SIGINT", async () => {
   logger.info("SIGINT signal received: closing agent gracefully");
-  await agent.stopMonitoring();
+  await agent.shutdown();
   process.exit(0);
 });
