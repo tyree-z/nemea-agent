@@ -453,6 +453,12 @@ class NemeaAgent extends EventEmitter {
     const resolver = new dns.Resolver({timeout: this.settings.dnsTimeout, tries: 2});
     if (resolvers) resolver.setServers(resolvers);
 
+    // What actually answered, not what was asked for - and needed on the failure path
+    // too, where there is no result to read it back from.
+    const answering = resolvers ? resolvers.join(", ") : "system";
+    const startedAt = performance.now();
+    const elapsed = () => Math.round((performance.now() - startedAt) * 100) / 100;
+
     const ask = (method, ...args) =>
       new Promise((resolve, reject) => {
         resolver[method](domain, ...args, (err, value) => {
@@ -483,10 +489,13 @@ class NemeaAgent extends EventEmitter {
       const detailedResult = {
         recordType,
         domain,
-        // What actually answered, not what was asked for: "default" hid which
-        // resolver produced a result, which is half of what a DNS check is for.
-        server: resolvers ? resolvers.join(", ") : "system",
+        server: answering,
         records: result,
+        // The measurement, which was never taken. Without it a DNS monitor has no
+        // response time at any point in the system: nothing to store, nothing to
+        // average, and a status card that can only show a count of checks.
+        durationMs: elapsed(),
+        ok: true,
       };
       if (recordType === "SOA") {
         detailedResult.hostmaster = result.hostmaster;
@@ -497,7 +506,18 @@ class NemeaAgent extends EventEmitter {
       return detailedResult;
     } catch (error) {
       logger.error(`Error resolving DNS for ${domain}:`, error);
-      return null;
+      // A failure is the measurement, not the absence of one. Returning null here meant
+      // the caller skipped the send, so a name that stopped resolving left no trace and
+      // the monitor went on reporting the uptime of the samples that had worked.
+      return {
+        recordType,
+        domain,
+        server: answering,
+        records: [],
+        durationMs: elapsed(),
+        ok: false,
+        error: error.message,
+      };
     }
   }
 
@@ -531,10 +551,13 @@ class NemeaAgent extends EventEmitter {
       const pingSummary = {min, max, avg, packetLoss, times: pingResults};
       logger.debug("Ping results summary:", pingSummary);
       return pingSummary;
-    } else {
-      logger.warn(`No successful ping responses from ${host}.`);
-      return null;
     }
+
+    // Every probe failed, which is the outage this monitor exists to catch. This
+    // returned null and the caller skipped the send, so partial loss was recorded
+    // faithfully and total loss - the case that matters - was recorded not at all.
+    logger.warn(`No successful ping responses from ${host}.`);
+    return {min: null, max: null, avg: null, packetLoss: 100, times: []};
   }
 
   async getGeolocation() {
