@@ -9,18 +9,35 @@ on:
       - "v*" # Match any tag that starts with 'v'
 
 jobs:
+  # Nothing is published without this passing first. The agent has no test suite, so
+  # this is the floor rather than the ceiling: dependencies resolve, and the file the
+  # container runs actually parses. A syntax error used to reach Docker Hub and only
+  # announce itself when a probe somewhere restarted.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Parse the agent
+        run: node --check agent.js
+
   build-and-push:
+    needs: check
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@v2
+        uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
@@ -36,7 +53,7 @@ jobs:
             echo "Building release image with tag: $TAG"
             docker buildx build --platform linux/amd64,linux/arm64 \
               -t tyreez/nemea-agent:$TAG \
-              -t tyreez/nemea-agent:latest \ # Tag the latest release image
+              -t tyreez/nemea-agent:latest \
               --push .
           elif [[ $GITHUB_REF == refs/heads/dev ]]; then
             # For dev branch
