@@ -421,12 +421,20 @@ class NemeaAgent extends EventEmitter {
     }
   }
 
+  /**
+   * Resolve one name, from one resolver, without disturbing anything else.
+   *
+   * Deliberately a `dns.Resolver` per call rather than `dns.setServers`, which is
+   * process-global: a monitor naming its own resolver used to change the resolver for
+   * every other monitor and for on-demand measurements too, and the ones that had not
+   * named a server silently measured whatever the last one configured. The result was
+   * wrong rather than failed, which is the worst way for it to be wrong.
+   *
+   * The timeout goes on the resolver for the same class of reason. It was being passed
+   * in the options object of `dns.resolve4`, which accepts only `{ttl}` — so it was
+   * ignored, and `dnsTimeout` had never done anything at all.
+   */
   async monitorDNS(recordType, domain, server) {
-    logger.debug(
-      `Monitoring DNS: ${recordType} for ${domain} using server: ${
-        server || "default"
-      }`
-    );
     // A monitor naming a resolver wins; otherwise this agent's configured ones; and
     // failing both, whatever the machine itself uses - which is usually the honest
     // measurement, since it is what somebody at this location would actually get.
@@ -435,50 +443,38 @@ class NemeaAgent extends EventEmitter {
       : this.settings.dnsServers?.length
         ? this.settings.dnsServers
         : null;
-    if (resolvers) dns.setServers(resolvers);
+
+    logger.debug(
+      `Monitoring DNS: ${recordType} for ${domain} using ${
+        resolvers ? resolvers.join(", ") : "the system resolver"
+      }`
+    );
+
+    const resolver = new dns.Resolver({timeout: this.settings.dnsTimeout, tries: 2});
+    if (resolvers) resolver.setServers(resolvers);
+
+    const ask = (method, ...args) =>
+      new Promise((resolve, reject) => {
+        resolver[method](domain, ...args, (err, value) => {
+          if (err) reject(err);
+          else resolve(value);
+        });
+      });
 
     try {
       let result;
       switch (recordType) {
         case "A":
-          result = await new Promise((resolve, reject) => {
-            dns.resolve4(
-              domain,
-              {ttl: true, timeout: this.settings.dnsTimeout},
-              (err, addresses) => {
-                if (err) reject(err);
-                else resolve(addresses);
-              }
-            );
-          });
+          result = await ask("resolve4", {ttl: true});
           break;
         case "AAAA":
-          result = await new Promise((resolve, reject) => {
-            dns.resolve6(
-              domain,
-              {ttl: true, timeout: this.settings.dnsTimeout},
-              (err, addresses) => {
-                if (err) reject(err);
-                else resolve(addresses);
-              }
-            );
-          });
+          result = await ask("resolve6", {ttl: true});
           break;
         case "SOA":
-          result = await new Promise((resolve, reject) => {
-            dns.resolveSoa(domain, (err, soaRecord) => {
-              if (err) reject(err);
-              else resolve(soaRecord);
-            });
-          });
+          result = await ask("resolveSoa");
           break;
         case "CNAME":
-          result = await new Promise((resolve, reject) => {
-            dns.resolveCname(domain, (err, cnameRecords) => {
-              if (err) reject(err);
-              else resolve(cnameRecords);
-            });
-          });
+          result = await ask("resolveCname");
           break;
         default:
           throw new Error("Unsupported record type");
@@ -487,7 +483,9 @@ class NemeaAgent extends EventEmitter {
       const detailedResult = {
         recordType,
         domain,
-        server: server || "default",
+        // What actually answered, not what was asked for: "default" hid which
+        // resolver produced a result, which is half of what a DNS check is for.
+        server: resolvers ? resolvers.join(", ") : "system",
         records: result,
       };
       if (recordType === "SOA") {
